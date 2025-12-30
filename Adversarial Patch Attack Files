@@ -1,0 +1,452 @@
+#utils.py
+import numpy as np
+import csv
+import os
+import matplotlib.pyplot as plt
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.utils.data.sampler import SubsetRandomSampler
+
+# Load the datasets
+# Modified to use torchvision.datasets.Imagenette
+def dataloader(train_size, test_size, data_dir, batch_size, num_workers, total_num=50000):
+    # Setup the transformation
+    train_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+
+    test_transforms = transforms.Compose([
+        transforms.Resize(size=(224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+
+    # Ensure data directory exists
+    os.makedirs(data_dir, exist_ok=True)
+
+    print(f"Loading/Downloading Imagenette to {data_dir}...")
+    
+    # Load Imagenette Train and Val splits
+    train_dataset = torchvision.datasets.Imagenette(
+        root=data_dir, 
+        split='train', 
+        size='full', 
+        download=True, 
+        transform=train_transforms
+    )
+    
+    test_dataset = torchvision.datasets.Imagenette(
+        root=data_dir, 
+        split='val', 
+        size='full', 
+        download=True, 
+        transform=test_transforms
+    )
+
+    # Handle Subsetting
+    # We create indices for the train set
+    train_indices = np.arange(len(train_dataset))
+    # If the requested train_size is smaller than the dataset, sample randomly
+    if train_size < len(train_dataset):
+        np.random.shuffle(train_indices)
+        train_indices = train_indices[:train_size]
+    
+    # We create indices for the test set
+    test_indices = np.arange(len(test_dataset))
+    # If the requested test_size is smaller than the dataset, sample randomly
+    if test_size < len(test_dataset):
+        np.random.shuffle(test_indices)
+        test_indices = test_indices[:test_size]
+
+    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, sampler=SubsetRandomSampler(train_indices), num_workers=num_workers, pin_memory=True, shuffle=False)
+    test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, sampler=SubsetRandomSampler(test_indices), num_workers=num_workers, pin_memory=True, shuffle=False)
+    
+    return train_loader, test_loader
+
+# Test the model on clean dataset
+def test(model, dataloader):
+    model.eval()
+    correct, total, loss = 0, 0, 0
+    with torch.no_grad():
+        for (images, labels) in dataloader:
+            images = images.cuda()
+            labels = labels.cuda()
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.shape[0]
+            # Note: valid only if dataset labels map 1:1 to model output indices
+            correct += (predicted == labels).sum().item()
+    return correct / total
+
+# Load the log and generate the training line
+def log_generation(log_dir):
+    # Load the statistics in the log
+    epochs, train_rate, test_rate = [], [], []
+    with open(log_dir, 'r') as f:
+        reader = csv.reader(f)
+        flag = 0
+        for i in reader:
+            if flag == 0:
+                flag += 1
+                continue
+            else:
+                epochs.append(int(i[0]))
+                train_rate.append(float(i[1]))
+                test_rate.append(float(i[2]))
+
+    # Generate the success line
+    plt.figure(num=0)
+    plt.plot(epochs, test_rate, label='test_success_rate', linewidth=2, color='r')
+    plt.plot(epochs, train_rate, label='train_success_rate', linewidth=2, color='b')
+    plt.xlabel("epoch")
+    plt.ylabel("success rate")
+    plt.xlim(-1, max(epochs) + 1)
+    plt.ylim(0, 1.0)
+    plt.title("patch attack success rate")
+    plt.legend()
+    plt.savefig("training_pictures/patch_attack_success_rate.png")
+    plt.close(0)
+
+#patch_utils.py
+
+import numpy as np
+import torch
+
+# Initialize the patch
+# TODO: Add circle type
+def patch_initialization(patch_type='rectangle', image_size=(3, 224, 224), noise_percentage=0.03):
+    if patch_type == 'rectangle':
+        mask_length = int((noise_percentage * image_size[1] * image_size[2])**0.5)
+        patch = np.random.rand(image_size[0], mask_length, mask_length)
+    return patch
+
+# Generate the mask and apply the patch
+# TODO: Add circle type
+def mask_generation(mask_type='rectangle', patch=None, image_size=(3, 224, 224)):
+    applied_patch = np.zeros(image_size)
+    if mask_type == 'rectangle':
+        # patch rotation
+        rotation_angle = np.random.choice(4)
+        for i in range(patch.shape[0]):
+            patch[i] = np.rot90(patch[i], rotation_angle)  # The actual rotation angle is rotation_angle * 90
+        # patch location
+        x_location, y_location = np.random.randint(low=0, high=image_size[1]-patch.shape[1]), np.random.randint(low=0, high=image_size[2]-patch.shape[2])
+        for i in range(patch.shape[0]):
+            applied_patch[:, x_location:x_location + patch.shape[1], y_location:y_location + patch.shape[2]] = patch
+    mask = applied_patch.copy()
+    mask[mask != 0] = 1.0
+    return applied_patch, mask, x_location, y_location
+
+# Test the patch on dataset
+def test_patch(patch_type, target, patch, test_loader, model):
+    model.eval()
+    test_total, test_actual_total, test_success = 0, 0, 0
+    for (image, label) in test_loader:
+        test_total += label.shape[0]
+        assert image.shape[0] == 1, 'Only one picture should be loaded each time.'
+        image = image.cuda()
+        label = label.cuda()
+        output = model(image)
+        _, predicted = torch.max(output.data, 1)
+        if predicted[0] != label and predicted[0].data.cpu().numpy() != target:
+            test_actual_total += 1
+            applied_patch, mask, x_location, y_location = mask_generation(patch_type, patch, image_size=(3, 224, 224))
+            applied_patch = torch.from_numpy(applied_patch)
+            mask = torch.from_numpy(mask)
+            perturbated_image = torch.mul(mask.type(torch.FloatTensor), applied_patch.type(torch.FloatTensor)) + torch.mul((1 - mask.type(torch.FloatTensor)), image.type(torch.FloatTensor))
+            perturbated_image = perturbated_image.cuda()
+            output = model(perturbated_image)
+            _, predicted = torch.max(output.data, 1)
+            if predicted[0].data.cpu().numpy() == target:
+                test_success += 1
+    return test_success / test_actual_total
+
+# Attack.py
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import torchvision
+from torchvision import models
+
+import argparse
+import csv
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+from patch_utils import*
+from utils import*
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--batch_size', type=int, default=1, help="batch size")
+parser.add_argument('--num_workers', type=int, default=2, help="num_workers")
+parser.add_argument('--train_size', type=int, default=2000, help="number of training images")
+parser.add_argument('--test_size', type=int, default=2000, help="number of test images")
+parser.add_argument('--noise_percentage', type=float, default=0.1, help="percentage of the patch size compared with the image size")
+parser.add_argument('--probability_threshold', type=float, default=0.9, help="minimum target probability")
+parser.add_argument('--lr', type=float, default=1.0, help="learning rate")
+parser.add_argument('--max_iteration', type=int, default=1000, help="max iteration")
+parser.add_argument('--target', type=int, default=859, help="target label")
+parser.add_argument('--epochs', type=int, default=20, help="total epoch")
+parser.add_argument('--data_dir', type=str, default='./data', help="dir of the dataset")
+parser.add_argument('--patch_type', type=str, default='rectangle', help="type of the patch")
+parser.add_argument('--GPU', type=str, default='0', help="index pf used GPU")
+parser.add_argument('--log_dir', type=str, default='patch_attack_log.csv', help='dir of the log')
+args = parser.parse_args()
+
+os.makedirs("training_pictures", exist_ok=True)
+
+def patch_attack(image, applied_patch, mask, target, probability_threshold, model, lr=1, max_iteration=100):
+    model.eval()
+    applied_patch = torch.from_numpy(applied_patch)
+    mask = torch.from_numpy(mask)
+    target_probability, count = 0, 0
+    perturbated_image = torch.mul(mask.type(torch.FloatTensor), applied_patch.type(torch.FloatTensor)) + torch.mul((1 - mask.type(torch.FloatTensor)), image.type(torch.FloatTensor))
+    while target_probability < probability_threshold and count < max_iteration:
+        count += 1
+        perturbated_image = Variable(perturbated_image.data, requires_grad=True)
+        per_image = perturbated_image.cuda()
+        output = model(per_image)
+        target_log_softmax = torch.nn.functional.log_softmax(output, dim=1)[0][target]
+        target_log_softmax.backward()
+        patch_grad = perturbated_image.grad.clone().cpu()
+        perturbated_image.grad.data.zero_()
+        applied_patch = lr * patch_grad + applied_patch.type(torch.FloatTensor)
+        applied_patch = torch.clamp(applied_patch, min=-3, max=3)
+        perturbated_image = torch.mul(mask.type(torch.FloatTensor), applied_patch.type(torch.FloatTensor)) + torch.mul((1-mask.type(torch.FloatTensor)), image.type(torch.FloatTensor))
+        perturbated_image = torch.clamp(perturbated_image, min=-3, max=3)
+        perturbated_image = perturbated_image.cuda()
+        output = model(perturbated_image)
+        target_probability = torch.nn.functional.softmax(output, dim=1).data[0][target]
+    perturbated_image = perturbated_image.cpu().numpy()
+    applied_patch = applied_patch.cpu().numpy()
+    return perturbated_image, applied_patch
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.GPU
+
+model = models.resnet50(pretrained=True).cuda()
+model.eval()
+
+train_loader, test_loader = dataloader(args.train_size, args.test_size, args.data_dir, args.batch_size, args.num_workers, 50000)
+
+print("Checking dataset...")
+test(model, train_loader) 
+
+patch = patch_initialization(args.patch_type, image_size=(3, 224, 224), noise_percentage=args.noise_percentage)
+print('The shape of the patch is', patch.shape)
+
+with open(args.log_dir, 'w') as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch", "train_success", "test_success"])
+
+best_patch_epoch, best_patch_success_rate = 0, 0
+
+for epoch in range(args.epochs):
+    train_total, train_actual_total, train_success = 0, 0, 0
+    for (image, label) in train_loader:
+        train_total += label.shape[0]
+        assert image.shape[0] == 1, 'Only one picture should be loaded each time.'
+        image = image.cuda()
+        label = label.cuda()
+        output = model(image)
+        _, predicted = torch.max(output.data, 1)
+        if predicted[0].data.cpu().numpy() != args.target:
+             train_actual_total += 1
+             applied_patch, mask, x_location, y_location = mask_generation(args.patch_type, patch, image_size=(3, 224, 224))
+             perturbated_image, applied_patch = patch_attack(image, applied_patch, mask, args.target, args.probability_threshold, model, args.lr, args.max_iteration)
+             perturbated_image = torch.from_numpy(perturbated_image).cuda()
+             output = model(perturbated_image)
+             _, predicted = torch.max(output.data, 1)
+             if predicted[0].data.cpu().numpy() == args.target:
+                 train_success += 1
+             patch = applied_patch[0][:, x_location:x_location + patch.shape[1], y_location:y_location + patch.shape[2]]
+    
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    plt.imshow(np.clip(np.transpose(patch, (1, 2, 0)) * std + mean, 0, 1))
+    plt.savefig("training_pictures/" + str(epoch) + " patch.png")
+    
+    print("Epoch:{} Patch attack success rate on trainset: {:.3f}%".format(epoch, 100 * train_success / (train_actual_total + 1e-10)))
+    test_success_rate = test_patch(args.patch_type, args.target, patch, test_loader, model)
+    print("Epoch:{} Patch attack success rate on testset: {:.3f}%".format(epoch, 100 * test_success_rate))
+
+    with open(args.log_dir, 'a') as f:
+        writer = csv.writer(f)
+        writer.writerow([epoch, 0, test_success_rate])
+
+    if test_success_rate > best_patch_success_rate:
+        best_patch_success_rate = test_success_rate
+        best_patch_epoch = epoch
+        plt.imshow(np.clip(np.transpose(patch, (1, 2, 0)) * std + mean, 0, 1))
+        plt.savefig("training_pictures/best_patch.png")
+        # --- NEW LINE ADDED BELOW ---
+        np.save("training_pictures/best_patch.npy", patch)
+
+    log_generation(args.log_dir)
+
+print("The best patch is found at epoch {} with success rate {}% on testset".format(best_patch_epoch, 100 * best_patch_success_rate))
+
+#test_visualization.py
+import torch
+import torchvision
+from torchvision import models, transforms
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import json
+import urllib.request
+# Assuming you have patch_utils.py in the same directory
+from patch_utils import mask_generation
+
+# --- Configuration ---
+DATA_DIR = './data'
+PATCH_PATH = 'training_pictures/best_patch.npy'
+# Make sure this matches your folder structure or comment out if generating new patch
+# If you don't have a patch file, the code below handles the error.
+TARGET_LABEL_IDX = 859 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+OUTPUT_FILE = "colab_result.png" 
+CLEAN_TENSOR_FILE = "clean_img_tensor.pt" 
+ADV_TENSOR_FILE = "adv_img_tensor.pt"     
+
+# --- Helpers ---
+def get_imagenet_labels():
+    url = "https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json"
+    try:
+        with urllib.request.urlopen(url) as response:
+            labels = json.loads(response.read())
+        return labels
+    except:
+        return None
+
+labels_map = get_imagenet_labels()
+
+def get_label_name(index):
+    if labels_map:
+        return f"{index}: {labels_map[index]}"
+    return f"Class {index}"
+
+def denormalize_single(tensor, mean, std):
+    """Helper to convert Normalized Tensor -> [0, 1] Numpy Image"""
+    t = tensor.clone().detach().cpu()
+    for i in range(3):
+        t[i] = t[i] * std[i] + mean[i]
+    return torch.clamp(t, 0, 1)
+
+# --- Setup Model ---
+print(f"Loading ResNet50 on {DEVICE}...")
+model = models.resnet50(pretrained=True).to(DEVICE)
+model.eval()
+
+# ImageNet Stats
+norm_mean = [0.485, 0.456, 0.406]
+norm_std = [0.229, 0.224, 0.225]
+
+# Transforms
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(norm_mean, norm_std)
+])
+
+# --- Load Dataset ---
+print("Loading Imagenette Validation Set...")
+try:
+    testset = torchvision.datasets.Imagenette(root=DATA_DIR, split='val', size='full', download=True, transform=transform)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=True)
+    image, label = next(iter(testloader))
+except:
+    print("Dataset not found or download failed. Creating dummy data...")
+    image = torch.randn(1, 3, 224, 224) # Dummy
+
+image = image.to(DEVICE)
+
+# --- Load Patch ---
+if not os.path.exists(PATCH_PATH):
+    print(f"Warning: {PATCH_PATH} not found. creating random patch for testing.")
+    patch_numpy = np.random.rand(3, 70, 70).astype(np.float32)
+else:
+    print(f"Loading patch from {PATCH_PATH}...")
+    patch_numpy = np.load(PATCH_PATH)
+
+# --- Process ---
+
+# 1. Clean Inference
+output_clean = model(image)
+top_class_clean = torch.argmax(output_clean, 1)
+conf_clean = torch.nn.functional.softmax(output_clean, dim=1)[0][top_class_clean].item()
+
+# 2. Generate Mask & Apply Patch
+# Note: mask_generation returns numpy arrays
+applied_patch, mask, x, y = mask_generation('rectangle', patch_numpy.copy(), image_size=(3, 224, 224))
+
+applied_patch_t = torch.from_numpy(applied_patch).float().to(DEVICE)
+mask_t = torch.from_numpy(mask).float().to(DEVICE)
+
+# -------------------------------------------------------------------------
+# CRITICAL FIX: Constructing the Image for Inference vs Saving
+# -------------------------------------------------------------------------
+
+# A. Construct for INFERENCE (Model expects Normalized Background)
+# Note: This is a simplistic attack mix. Ideally, you should denormalize background, 
+# add patch, then re-normalize. But sticking to your logic for inference:
+adv_image_inference = torch.mul(mask_t, applied_patch_t) + torch.mul((1 - mask_t), image)
+# We don't clamp inference input to 0-1 because it's normalized (can be negative)
+
+# Adversarial Inference
+output_adv = model(adv_image_inference)
+top_class_adv = torch.argmax(output_adv, 1)
+conf_adv = torch.nn.functional.softmax(output_adv, dim=1)[0][top_class_adv].item()
+conf_target = torch.nn.functional.softmax(output_adv, dim=1)[0][TARGET_LABEL_IDX].item()
+
+# B. Construct for SAVING / VISUALIZATION (Must be pure [0, 1] range)
+print(f"Processing tensors for saving...")
+
+mean_t = torch.tensor(norm_mean).view(1, 3, 1, 1).to(DEVICE)
+std_t = torch.tensor(norm_std).view(1, 3, 1, 1).to(DEVICE)
+
+# Get clean background in [0, 1]
+clean_01 = image * std_t + mean_t
+clean_01 = torch.clamp(clean_01, 0, 1)
+
+# Compose Adversarial Image in [0, 1] space
+# applied_patch_t is already 0-1. clean_01 is 0-1.
+adv_01 = torch.mul(mask_t, applied_patch_t) + torch.mul((1 - mask_t), clean_01)
+adv_01 = torch.clamp(adv_01, 0, 1)
+
+# Upscale to 512x512 for the Diffusion Model
+clean_512 = F.interpolate(clean_01, size=(512, 512), mode='bilinear', align_corners=False)
+adv_512 = F.interpolate(adv_01, size=(512, 512), mode='bilinear', align_corners=False)
+
+print(f"Saving 512x512 tensors to {CLEAN_TENSOR_FILE} and {ADV_TENSOR_FILE}...")
+# Save on CPU
+torch.save(clean_512.detach().cpu(), CLEAN_TENSOR_FILE)
+torch.save(adv_512.detach().cpu(), ADV_TENSOR_FILE)
+
+print("Tensors saved successfully.")
+
+# --- Visuals ---
+img_clean_vis = clean_01[0].permute(1, 2, 0).detach().cpu().numpy()
+img_adv_vis = adv_01[0].permute(1, 2, 0).detach().cpu().numpy()
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+axes[0].imshow(img_clean_vis)
+axes[0].set_title(f"Clean (224px)\n{get_label_name(top_class_clean.item())}\n{conf_clean:.2%}")
+axes[0].axis('off')
+
+axes[1].imshow(img_adv_vis)
+color = 'red' if top_class_adv.item() == TARGET_LABEL_IDX else 'black'
+axes[1].set_title(f"Attacked (224px)\n{get_label_name(top_class_adv.item())}\n{conf_adv:.2%}\nTarget Prob: {conf_target:.2%}", color=color)
+axes[1].axis('off')
+
+plt.tight_layout()
+plt.savefig(OUTPUT_FILE)
+print(f"Result plot saved to {OUTPUT_FILE}")
