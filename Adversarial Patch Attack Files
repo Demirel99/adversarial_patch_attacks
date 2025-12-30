@@ -450,3 +450,283 @@ axes[1].axis('off')
 plt.tight_layout()
 plt.savefig(OUTPUT_FILE)
 print(f"Result plot saved to {OUTPUT_FILE}")
+
+#patch_detection.py
+# find mask and inpaint
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from diffusers import StableDiffusionPipeline, AutoencoderTiny, AutoencoderKL, StableDiffusionInpaintPipeline
+from skimage.filters import threshold_otsu
+from skimage.transform import resize
+import scipy.ndimage
+import PIL.Image
+import gc
+import os
+
+# ------------------------------------------------------------------------------
+# 0. Setup & Memory
+# ------------------------------------------------------------------------------
+def cleanup():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+cleanup()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Loading Models to {device}...")
+model_id = "runwayml/stable-diffusion-v1-5"
+
+# 1. Load Main Pipeline
+pipe = StableDiffusionPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    variant="fp16"
+).to(device)
+
+# 2. Load Speed VAE (For Detection Loop)
+tiny_vae = AutoencoderTiny.from_pretrained(
+    "madebyollin/taesd",
+    torch_dtype=torch.float16
+).to(device)
+
+# 3. Load Quality VAE (For Final Restoration)
+quality_vae = AutoencoderKL.from_pretrained(
+    "stabilityai/sd-vae-ft-mse",
+    torch_dtype=torch.float16
+).to(device)
+
+pipe.vae = quality_vae
+
+# Shortcuts
+unet = pipe.unet
+scheduler = pipe.scheduler
+text_encoder = pipe.text_encoder
+
+# Freeze
+tiny_vae.requires_grad_(False)
+quality_vae.requires_grad_(False)
+unet.requires_grad_(False)
+text_encoder.requires_grad_(False)
+
+# ------------------------------------------------------------------------------
+# 1. The Detection Optimization
+# ------------------------------------------------------------------------------
+
+def optimize_patch_detection_ldm(y_obs, num_steps=300):
+
+    # Encode with TINY VAE for speed
+    with torch.no_grad():
+        # y_obs expected in range [-1, 1]
+        init_latents = tiny_vae.encode(y_obs).latents
+
+    # Parameters
+    z_opt = init_latents.clone().detach().float().requires_grad_(True)
+    # w_opt = torch.zeros(1, 1, 64, 64, device=device).float().requires_grad_(True)
+    w_opt = torch.full((1, 1, 64, 64), -4.0, device=device).float().requires_grad_(True)
+
+    w_ema = w_opt.detach().clone()
+    ema_decay = 0.95
+
+    optimizer = optim.Adam([
+        {'params': z_opt, 'lr': 0.05},
+        {'params': w_opt, 'lr': 0.1}
+    ])
+
+    text_input = pipe.tokenizer([""], padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt")
+    text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
+
+    print(f"--- Stage 1: Detecting Mask ({num_steps} steps) ---")
+
+    for step in range(num_steps):
+        optimizer.zero_grad()
+
+        # 1. Decode Image
+        x_est = tiny_vae.decode(z_opt.half()).sample.float()
+
+        # 2. Mask Logic
+        m_small = torch.sigmoid(w_opt)
+        m_large = F.interpolate(m_small, size=(512, 512), mode='bilinear', align_corners=False)
+
+        # 3. Fidelity Loss
+        loss_fidelity = torch.mean(((1 - m_large) * (y_obs.float() - x_est)) ** 2)
+
+        # 4. Mask Priors
+        loss_sparsity = torch.mean(m_small)
+        loss_tv = (torch.mean(torch.abs(m_small[:, :, :-1, :] - m_small[:, :, 1:, :])) +
+                   torch.mean(torch.abs(m_small[:, :, :, :-1] - m_small[:, :, :, 1:])))
+
+        # 5. SDS Loss
+        t = torch.randint(20, 980, (1,), device=device).long()
+        noise = torch.randn_like(z_opt).half()
+        noisy_z = scheduler.add_noise(z_opt.half(), noise, t)
+
+        with torch.no_grad():
+            noise_pred = unet(noisy_z, t, encoder_hidden_states=text_embeddings).sample
+
+        grad_sds = (noise_pred.float() - noise.float())
+        target_z = (z_opt - grad_sds).detach()
+        loss_sds = 0.5 * F.mse_loss(z_opt, target_z)
+
+        # Weights
+        w_fid, w_sds, w_spa, w_tv = 2000.0, 150.0, 80.0, 200.0
+        total_loss = (w_fid * loss_fidelity + w_sds * loss_sds + w_spa * loss_sparsity + w_tv * loss_tv)
+
+        total_loss.backward()
+        optimizer.step()
+
+        # EMA for Mask
+        with torch.no_grad():
+            w_ema = ema_decay * w_ema + (1 - ema_decay) * w_opt
+
+        if step % 100 == 0:
+            ema_m_mean = torch.sigmoid(w_ema).mean().item()
+            plt.imshow(torch.sigmoid(w_ema).squeeze().cpu().numpy())
+            plt.title(f'EMA Mask (Step {step})')
+            plt.axis('off')
+            plt.show()
+            print(f"Step {step}: Loss {total_loss.item():.2f} | "
+                  f"EMA MaskMean {ema_m_mean:.3f}")
+
+    # Extract Binary Mask
+    with torch.no_grad():
+        prob_map_small = torch.sigmoid(w_ema)
+        plt.imshow(prob_map_small.squeeze().cpu().numpy())
+        #show heat map value on the side
+        plt.colorbar()
+        plt.title('Final Mask')
+        plt.axis('off')
+        plt.show()
+        prob_map_large = F.interpolate(prob_map_small, size=(512, 512), mode='bilinear').cpu().numpy().squeeze()
+
+        thresh = prob_map_large.max()*0.5
+        final_mask_np = (prob_map_large > thresh).astype(float)
+
+        # if prob_map_large.max() < 0.1:
+        #     final_mask_np = np.zeros_like(prob_map_large)
+        # else:
+        #     try:
+        #         thresh = threshold_otsu(prob_map_large)
+        #         final_mask_np = (prob_map_large > thresh).astype(float)
+        #     except:
+        #         final_mask_np = (prob_map_large > 0.5).astype(float)
+
+    return final_mask_np
+
+# ------------------------------------------------------------------------------
+# 2. The Restoration Pass
+# ------------------------------------------------------------------------------
+
+def high_quality_restoration(original_tensor, mask_np):
+    print("--- Stage 2: High Quality Restoration ---")
+
+    # Clean Memory for Inpainting Model
+    global pipe, tiny_vae
+    del pipe
+    del tiny_vae
+    torch.cuda.empty_cache()
+
+    # Dilate Mask to cover edges
+    mask_dilated = scipy.ndimage.binary_dilation(mask_np, iterations=10)
+
+    # Convert to PIL
+    # Original tensor is [-1, 1], convert to [0, 255]
+    original_img_np = (original_tensor.squeeze().permute(1, 2, 0).cpu().numpy() + 1) / 2
+    original_img_np = np.clip(original_img_np * 255, 0, 255).astype(np.uint8)
+
+    mask_img_np = (mask_dilated * 255).astype(np.uint8)
+
+    image_pil = PIL.Image.fromarray(original_img_np)
+    mask_pil = PIL.Image.fromarray(mask_img_np)
+
+    # Load Inpainting Model
+    inpaint_pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        "runwayml/stable-diffusion-inpainting",
+        torch_dtype=torch.float16,
+        variant="fp16"
+    ).to(device)
+
+    try:
+        result = inpaint_pipe(
+            prompt="",
+            image=image_pil,
+            mask_image=mask_pil,
+            num_inference_steps=40,
+            strength=1.0,
+            guidance_scale=7.5
+        ).images[0]
+
+        return result
+
+    except Exception as e:
+        print(f"Pipeline Error: {e}")
+        return image_pil
+
+# ------------------------------------------------------------------------------
+# 3. Execution
+# ------------------------------------------------------------------------------
+
+def prepare_tensor_from_file(path, target_size=(512, 512)):
+    print(f"Loading {path}...")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File {path} not found. Run the generation script first.")
+
+    img_tensor = torch.load(path)
+
+    # Ensure correct shape (B, C, H, W)
+    if img_tensor.dim() == 3: img_tensor = img_tensor.unsqueeze(0)
+
+    # Ensure range [0, 1] before normalizing to [-1, 1]
+    if img_tensor.max() > 1.0: img_tensor = img_tensor / 255.0
+
+    img_resized = F.interpolate(img_tensor, size=target_size, mode='bilinear', align_corners=False)
+
+    # Normalize to [-1, 1] for Stable Diffusion
+    img_normalized = (img_resized - 0.5) / 0.5
+    return img_normalized.to(device, dtype=torch.float16)
+
+# --- CHANGED: Use the ADVERSARIAL image created by Script 1 ---
+INPUT_PATH = "adv_img_tensor.pt"
+
+try:
+    # 1. Load Data
+    corrupted_tensor_512 = prepare_tensor_from_file(INPUT_PATH)
+
+    # 2. Run Optimization to find Mask
+    detected_mask_512 = optimize_patch_detection_ldm(corrupted_tensor_512, num_steps=500)
+
+    # 3. Run Restoration
+    restored_pil = high_quality_restoration(corrupted_tensor_512, detected_mask_512)
+
+    # 4. Visualization
+    original_size = (224, 224)
+
+    # Input (convert back to 0-1 for plotting)
+    input_np = (corrupted_tensor_512.detach().cpu().squeeze().float().permute(1, 2, 0).numpy() + 1) / 2
+    input_img_224 = resize(input_np, original_size)
+
+    # Mask
+    mask_224 = resize(detected_mask_512, original_size, order=0)
+
+    # Restored
+    restored_np = np.array(restored_pil.resize(original_size)) / 255.0
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    titles = ["Adversarial Input (from file)", "Detected Mask", "High-Quality Inpaint"]
+    imgs = [input_img_224, mask_224, restored_np]
+
+    for i in range(3):
+        ax[i].imshow(imgs[i], cmap='gray' if i==1 else None)
+        ax[i].set_title(titles[i])
+        ax[i].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+except Exception as e:
+    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
